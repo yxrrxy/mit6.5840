@@ -57,17 +57,17 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		switch task.TaskType {
 		case "map":
-			log.Printf("Worker %v starting map task %v on file %v", workerId, task.TaskNum, task.FileName)
+			//log.Printf("Worker %v starting map task %v on file %v", workerId, task.TaskNum, task.FileName)
 			doMap(task, mapf)
 			//log.Printf("Worker %v completed map task %v", workerId, task.TaskNum)
 		case "reduce":
-			log.Printf("Worker %v starting reduce task %v", workerId, task.TaskNum)
+			//log.Printf("Worker %v starting reduce task %v", workerId, task.TaskNum)
 			doReduce(task, reducef)
 			//log.Printf("Worker %v completed reduce task %v", workerId, task.TaskNum)
 		case "wait":
 			time.Sleep(time.Second)
 		case "exit":
-			log.Printf("Worker %v exiting", workerId)
+			//log.Printf("Worker %v exiting", workerId)
 			return
 		}
 	}

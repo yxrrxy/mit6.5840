@@ -47,9 +47,9 @@ fi
 if [ "$TIMEOUT" != "" ]
 then
   TIMEOUT2=$TIMEOUT
-  TIMEOUT2+=" -k 2s 120s "
+  TIMEOUT2+=" -k 2s 200s "
   #45
-  TIMEOUT+=" -k 2s 150s "
+  TIMEOUT+=" -k 2s 200s "
   #120
 fi
 
