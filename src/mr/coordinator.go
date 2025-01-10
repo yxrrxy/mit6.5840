@@ -2,6 +2,10 @@ package mr
 
 import (
 	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
 	"sync"
 	"time"
 )
@@ -10,19 +14,13 @@ type TaskStatus int
 type Phase int
 
 const (
-	MapPhase Phase = iota
-	ReducePhase
-	CompletePhase
-)
-
-const (
 	TaskPending TaskStatus = iota
 	TaskRunning
 	TaskCompleted
 )
 
 const (
-	TaskTimeout = 10 * time.Second
+	TaskTimeout = 40 * time.Second
 )
 
 type TaskInfo struct {
@@ -30,23 +28,21 @@ type TaskInfo struct {
 	StartTime time.Time
 	FileName  string
 	TaskNum   int
-	Attempts  int
 }
 
 type Coordinator struct {
 	files       []string
 	nReduce     int
-	phase       Phase
 	mapTasks    []TaskInfo
 	reduceTasks []TaskInfo
-	mu          sync.Mutex
+	mapMu       sync.RWMutex // 保护 mapTasks
+	reduceMu    sync.RWMutex // 保护 reduceTasks
 }
 
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		files:       files,
 		nReduce:     nReduce,
-		phase:       MapPhase,
 		mapTasks:    make([]TaskInfo, len(files)),
 		reduceTasks: make([]TaskInfo, nReduce),
 	}
@@ -61,9 +57,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	for i := range c.reduceTasks {
 		c.reduceTasks[i] = TaskInfo{
-			Status:   TaskPending,
-			FileName: files[i],
-			TaskNum:  i,
+			Status:  TaskPending,
+			TaskNum: i,
 		}
 	}
 
@@ -75,111 +70,140 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 func (c *Coordinator) checkTimeouts() {
 	for !c.Done() {
-		time.Sleep(time.Second)
-		c.mu.Lock()
+		time.Sleep(1 * time.Second)
 
-		if c.phase == MapPhase {
-			for i := range c.mapTasks {
-				if c.mapTasks[i].Status == TaskRunning &&
-					time.Since(c.mapTasks[i].StartTime) > TaskTimeout {
-					log.Printf("Map task %d timeout, resertting", i)
-					c.mapTasks[i].Status = TaskPending
-					c.mapTasks[i].Attempts++
-				}
+		// 检查 map 任务超时
+		c.mapMu.Lock()
+		for i := range c.mapTasks {
+			if c.mapTasks[i].Status == TaskRunning &&
+				time.Since(c.mapTasks[i].StartTime) > TaskTimeout {
+				c.mapTasks[i].Status = TaskPending
 			}
 		}
+		c.mapMu.Unlock()
 
-		c.mu.Unlock()
+		// 检查 reduce 任务超时
+		c.reduceMu.Lock()
+		for i := range c.reduceTasks {
+			if c.reduceTasks[i].Status == TaskRunning &&
+				time.Since(c.reduceTasks[i].StartTime) > TaskTimeout {
+				c.reduceTasks[i].Status = TaskPending
+			}
+		}
+		c.reduceMu.Unlock()
 	}
 }
 
 func (c *Coordinator) Done() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.phase == CompletePhase
+
+	for _, task := range c.mapTasks {
+		if task.Status != TaskCompleted {
+			return false
+		}
+	}
+
+	for _, task := range c.reduceTasks {
+		if task.Status != TaskCompleted {
+			return false
+		}
+	}
+
+	time.Sleep(5 * time.Second)
+	return true
+
 }
 
 func (c *Coordinator) AssignTask(args *TaskArgs, reply *TaskReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.updatePhase()
-
-	switch c.phase {
-	case MapPhase:
-		for i := range c.mapTasks {
-			if c.mapTasks[i].Status == TaskPending {
-				c.mapTasks[i].Status = TaskRunning
-				c.mapTasks[i].StartTime = time.Now()
-
-				reply.TaskType = "map"
-				reply.FileName = c.mapTasks[i].FileName
-				reply.TaskNum = i
-				reply.NReduce = c.nReduce
-				return nil
-			}
+	// 检查 map 任务
+	c.mapMu.Lock()
+	for i := range c.mapTasks {
+		if c.mapTasks[i].Status == TaskPending {
+			c.mapTasks[i].Status = TaskRunning
+			c.mapTasks[i].StartTime = time.Now()
+			reply.TaskType = "map"
+			reply.TaskNum = c.mapTasks[i].TaskNum
+			reply.FileName = c.mapTasks[i].FileName
+			reply.NReduce = c.nReduce
+			c.mapMu.Unlock()
+			return nil
 		}
-	case ReducePhase:
-		for i := range c.reduceTasks {
-			if c.reduceTasks[i].Status == TaskPending {
-				c.reduceTasks[i].Status = TaskRunning
-				c.reduceTasks[i].StartTime = time.Now()
-
-				reply.TaskType = "reduce"
-				reply.TaskNum = i
-				reply.NMap = len(c.mapTasks)
-			}
-		}
-
-	case CompletePhase:
-		reply.TaskType = "exit"
-		return nil
 	}
 
-	reply.TaskType = "wait"
+	// 检查是否有 map 任务在运行
+	for _, task := range c.mapTasks {
+		if task.Status != TaskCompleted {
+			reply.TaskType = "wait"
+			c.mapMu.Unlock()
+			return nil
+		}
+	}
+	c.mapMu.Unlock()
+	//log.Println("map tasks all done")
+	// 检查 reduce 任务
+	c.reduceMu.Lock()
+	for i := range c.reduceTasks {
+		if c.reduceTasks[i].Status == TaskPending {
+			c.reduceTasks[i].Status = TaskRunning
+			c.reduceTasks[i].StartTime = time.Now()
+			reply.TaskType = "reduce"
+			reply.TaskNum = c.reduceTasks[i].TaskNum
+			reply.NMap = len(c.mapTasks)
+			c.reduceMu.Unlock()
+			return nil
+		}
+	}
+
+	// 检查是否有 reduce 任务在运行
+	for _, task := range c.reduceTasks {
+		if task.Status != TaskCompleted {
+			reply.TaskType = "wait"
+			c.reduceMu.Unlock()
+			return nil
+		}
+	}
+	c.reduceMu.Unlock()
+
+	reply.TaskType = "exit"
 	return nil
 }
 
 func (c *Coordinator) ReportTask(args *ReportArgs, reply *ReportReply) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if args.TaskType == "map" {
+		c.mapMu.Lock()
+		if args.Success && c.mapTasks[args.TaskNum].Status == TaskRunning {
+			c.mapTasks[args.TaskNum].Status = TaskCompleted
+		} else {
+			c.mapTasks[args.TaskNum].Status = TaskPending
+			c.mapTasks[args.TaskNum].StartTime = time.Time{}
+		}
+		c.mapMu.Unlock()
 
-	if args.TaskArgs == "map" {
-		if c.phase == MapPhase && c.mapTasks[args.TaskNum].Status == TaskRunning {
-			c.mapTasks[args.TaskNum].Status = TaskCompleted
-		}
 	} else if args.TaskType == "reduce" {
-		if c.phase == ReducePhase && c.reduceTasks[args.TaskNum].Status == TaskRunning {
-			c.mapTasks[args.TaskNum].Status = TaskCompleted
+		c.reduceMu.Lock()
+		if args.Success && c.reduceTasks[args.TaskNum].Status == TaskRunning {
+			c.reduceTasks[args.TaskNum].Status = TaskCompleted
+		} else {
+			c.reduceTasks[args.TaskNum].Status = TaskPending
+			c.reduceTasks[args.TaskNum].StartTime = time.Time{}
 		}
+		c.reduceMu.Unlock()
+
 	}
 
-	c.updatePhase()
 	return nil
 }
 
-func (c *Coordinator) updatePhase() {
-	if c.phase == MapPhase {
-		allDone := true
-		for _, task := range c.mapTasks {
-			if task.Status != TaskCompleted {
-				allDone = false
-				break
-			}
-		}
-		if allDone {
-			c.phase = ReducePhase
-		}
-	} else if c.phase == ReducePhase {
-		allDone := true
-		for _, task := range c.reduceTasks {
-			if task.Status != TaskCompleted {
-				allDone = false
-				break
-			}
-		}
-		if allDone {
-			c.phase = CompletePhase
-		}
+func (c *Coordinator) server() {
+	rpc.Register(c)
+	rpc.HandleHTTP()
+
+	sockname := coordinatorSock()
+	os.Remove(sockname)
+
+	l, e := net.Listen("unix", sockname)
+	if e != nil {
+		log.Fatal("listen error:", e)
 	}
+
+	go http.Serve(l, nil)
 }

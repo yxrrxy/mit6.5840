@@ -1,42 +1,33 @@
 package mr
 
-type TaskArgs struct{
-	WokerId int
+import (
+	"os"
+	"strconv"
+)
+
+type TaskArgs struct {
+	WorkerId int
 }
 
-type TaskReply struct{
-	TaskType string		// "map", "reduce", "wait", "exit"
-	FileName string 
-	TaskNum int
-	NReduce int
-	NMap int
+type TaskReply struct {
+	TaskType string // "map", "reduce", "wait", "exit"
+	FileName string
+	TaskNum  int
+	NReduce  int
+	NMap     int
+	Error    string
 }
 
-type ReportArgs struct{
+type ReportArgs struct {
 	TaskType string
-	TaskNum int
+	TaskNum  int
+	WorkerId int
+	Success  bool
 }
 
-type ReportReply struct{
-
+type ReportReply struct {
 }
 
-import "os"
-import "strconv"
-
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
-
-
-// Add your RPC definitions here.
-
-
-// Cook up a unique-ish UNIX-domain socket name
-// in /var/tmp, for the coordinator.
-// Can't use the current directory since
-// Athena AFS doesn't support UNIX-domain sockets.
 func coordinatorSock() string {
 	s := "/var/tmp/5840-mr-"
 	s += strconv.Itoa(os.Getuid())
