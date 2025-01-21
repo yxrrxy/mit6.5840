@@ -20,7 +20,7 @@ const (
 )
 
 const (
-	TaskTimeout = 40 * time.Second
+	TaskTimeout = 15 * time.Second
 )
 
 type TaskInfo struct {

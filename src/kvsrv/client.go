@@ -4,10 +4,10 @@ import "6.5840/labrpc"
 import "crypto/rand"
 import "math/big"
 
-
 type Clerk struct {
-	server *labrpc.ClientEnd
-	// You will have to modify this struct.
+	server        *labrpc.ClientEnd
+	clientId      int64
+	nextRequestId int64
 }
 
 func nrand() int64 {
@@ -20,7 +20,7 @@ func nrand() int64 {
 func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.server = server
-	// You'll have to add code here.
+	ck.clientId = nrand()
 	return ck
 }
 
@@ -30,7 +30,7 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 //
 // you can send an RPC with code like this:
 // ok := ck.server.Call("KVServer.Get", &args, &reply)
-//
+//+
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
