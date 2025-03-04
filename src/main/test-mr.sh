@@ -48,9 +48,7 @@ if [ "$TIMEOUT" != "" ]
 then
   TIMEOUT2=$TIMEOUT
   TIMEOUT2+=" -k 2s 45s "
-  #45
   TIMEOUT+=" -k 2s 120s "
-  #120
 fi
 
 # run the test in a fresh sub-directory.

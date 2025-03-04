@@ -1,8 +1,13 @@
 package kvsrv
 
-import "6.5840/labrpc"
-import "crypto/rand"
-import "math/big"
+import (
+	"crypto/rand"
+	"math/big"
+	"sync/atomic"
+	"time"
+
+	"6.5840/labrpc"
+)
 
 type Clerk struct {
 	server        *labrpc.ClientEnd
@@ -30,14 +35,26 @@ func MakeClerk(server *labrpc.ClientEnd) *Clerk {
 //
 // you can send an RPC with code like this:
 // ok := ck.server.Call("KVServer.Get", &args, &reply)
-//+
+// +
 // the types of args and reply (including whether they are pointers)
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-
-	// You will have to modify this function.
-	return ""
+	args := &GetArgs{
+		Key:       key,
+		ClientId:  ck.clientId,
+		RequestId: atomic.AddInt64(&ck.nextRequestId, 1),
+	}
+	reply := &GetReply{}
+	for {
+		if ok := ck.server.Call("KVServer.Get", args, reply); ok {
+			if reply.Err == "ErrNoKey" {
+				return ""
+			}
+			return reply.Value
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // shared by Put and Append.
@@ -49,8 +66,25 @@ func (ck *Clerk) Get(key string) string {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) string {
-	// You will have to modify this function.
-	return ""
+	args := &PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Version:   0,
+		ClientId:  ck.clientId,
+		RequestId: atomic.AddInt64(&ck.nextRequestId, 1),
+	}
+	reply := &PutAppendReply{}
+	for {
+		if ok := ck.server.Call("KVServer."+op, args, reply); ok {
+			if reply.Err == "" {
+				if op == "Append" {
+					return reply.Value
+				}
+				return ""
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

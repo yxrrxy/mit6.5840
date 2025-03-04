@@ -69,28 +69,20 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 }
 
 func (c *Coordinator) checkTimeouts() {
-	for !c.Done() {
-		time.Sleep(1 * time.Second)
-
-		// 检查 map 任务超时
-		c.mapMu.Lock()
-		for i := range c.mapTasks {
-			if c.mapTasks[i].Status == TaskRunning &&
-				time.Since(c.mapTasks[i].StartTime) > TaskTimeout {
-				c.mapTasks[i].Status = TaskPending
-			}
+	time.Sleep(3 * time.Second)
+	for i := range c.mapTasks {
+		if c.mapTasks[i].Status == TaskRunning &&
+			time.Since(c.mapTasks[i].StartTime) > TaskTimeout {
+			c.mapTasks[i].Status = TaskCompleted
 		}
-		c.mapMu.Unlock()
+	}
 
-		// 检查 reduce 任务超时
-		c.reduceMu.Lock()
-		for i := range c.reduceTasks {
-			if c.reduceTasks[i].Status == TaskRunning &&
-				time.Since(c.reduceTasks[i].StartTime) > TaskTimeout {
-				c.reduceTasks[i].Status = TaskPending
-			}
+	// 检查 reduce 任务超时
+	for i := range c.reduceTasks {
+		if c.reduceTasks[i].Status == TaskRunning &&
+			time.Since(c.reduceTasks[i].StartTime) > TaskTimeout {
+			c.reduceTasks[i].Status = TaskCompleted
 		}
-		c.reduceMu.Unlock()
 	}
 }
 
@@ -108,7 +100,7 @@ func (c *Coordinator) Done() bool {
 		}
 	}
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(time.Second)
 	return true
 
 }

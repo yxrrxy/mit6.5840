@@ -74,11 +74,6 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func requestTask(workerId int) *TaskReply {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("Request task crashed: %v", r)
-		}
-	}()
 
 	args := TaskArgs{WorkerId: workerId}
 	reply := TaskReply{}
