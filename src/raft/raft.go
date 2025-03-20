@@ -69,7 +69,8 @@ type Raft struct {
 	commitIndex   int
 	lastApplied   int
 
-	applyCh chan ApplyMsg
+	applyCh         chan ApplyMsg
+	applyLogsActive bool // 控制是否已经启动应用日志的协程
 
 	// 领导者需要的状态
 	nextIndex  []int // 对于每个服务器，发送到该服务器的下一个日志条目的索引
@@ -169,20 +170,40 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
+	// 如果收到的任期小于当前任期，拒绝投票
 	if args.Term < rf.currentTerm {
 		return
 	}
 
+	// 如果收到更高的任期，更新自己的任期并转为Follower
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
 	}
 
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	// 检查是否可以投票（未投票或已投票给相同候选人）
+	// 同时检查候选人的日志是否至少与自己一样新
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := 0
+	if lastLogIndex >= 0 {
+		lastLogTerm = rf.log[lastLogIndex].Term
+	}
+
+	// 日志比较规则：
+	// 1. 如果任期不同，更高任期的日志更新
+	// 2. 如果任期相同，更长的日志更新
+	logIsUpToDate := false
+	if args.LastLogTerm > lastLogTerm {
+		logIsUpToDate = true
+	} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex {
+		logIsUpToDate = true
+	}
+
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && logIsUpToDate {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
-		rf.lastHeartbeat = time.Now()
+		rf.lastHeartbeat = time.Now() // 重置选举超时
 	}
 }
 
@@ -238,13 +259,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, rf.currentTerm, false
 	}
 
+	// 添加新的日志条目
 	entry := LogEntry{
 		Command: command,
 		Term:    rf.currentTerm,
 	}
 	rf.log = append(rf.log, entry)
-	index := len(rf.log) - 1
+	index := len(rf.log) - 1 // 新日志的索引
 
+	// 立即尝试复制日志
 	go rf.replicateLog()
 
 	return index, rf.currentTerm, true
@@ -255,6 +278,16 @@ func (rf *Raft) replicateLog() {
 	if rf.state != Leader {
 		rf.mu.Unlock()
 		return
+	}
+
+	// 确保nextIndex和matchIndex已初始化
+	if len(rf.nextIndex) != len(rf.peers) {
+		rf.nextIndex = make([]int, len(rf.peers))
+		rf.matchIndex = make([]int, len(rf.peers))
+		for i := range rf.peers {
+			rf.nextIndex[i] = len(rf.log) //后面会实现回退
+			rf.matchIndex[i] = 0
+		}
 	}
 
 	for i := range rf.peers {
@@ -269,13 +302,36 @@ func (rf *Raft) replicateLog() {
 
 func (rf *Raft) sendLogTo(server int) {
 	for !rf.killed() {
+		time.Sleep(10 * time.Millisecond)
+
 		rf.mu.Lock()
+		// 如果不再是Leader，退出
 		if rf.state != Leader {
 			rf.mu.Unlock()
 			return
 		}
 
-		prevLogIndex := rf.nextIndex[server] - 1
+		if len(rf.nextIndex) <= server || len(rf.log) == 0 {
+			rf.mu.Unlock()
+			continue
+		}
+
+		// 检查是否有新日志需要发送
+		nextIdx := rf.nextIndex[server]
+		if nextIdx >= len(rf.log) && rf.commitIndex <= rf.matchIndex[server] {
+			// 没有新日志需要发送，也没有需要更新的commitIndex
+			rf.mu.Unlock()
+			continue
+		}
+
+		if nextIdx >= len(rf.log) {
+			nextIdx = len(rf.log)
+			rf.nextIndex[server] = nextIdx
+		}
+
+		prevLogIndex := nextIdx - 1
+
+		// 确保prevLogIndex是有效的
 		if prevLogIndex < 0 {
 			prevLogIndex = 0
 		}
@@ -285,11 +341,16 @@ func (rf *Raft) sendLogTo(server int) {
 			prevLogTerm = rf.log[prevLogIndex].Term
 		}
 
-		entries := make([]LogEntry, 0)
-		if rf.nextIndex[server] < len(rf.log) {
-			entries = rf.log[rf.nextIndex[server]:]
+		// 准备要发送的条目
+		var entries []LogEntry
+		if nextIdx < len(rf.log) {
+			entries = make([]LogEntry, len(rf.log)-nextIdx)
+			copy(entries, rf.log[nextIdx:])
+		} else {
+			entries = []LogEntry{}
 		}
 
+		// 准备AppendEntries参数
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderId:     rf.me,
@@ -298,12 +359,23 @@ func (rf *Raft) sendLogTo(server int) {
 			Entries:      entries,
 			LeaderCommit: rf.commitIndex,
 		}
+		currentTerm := rf.currentTerm
 		rf.mu.Unlock()
 
+		// 发送AppendEntries RPC
 		reply := AppendEntriesReply{}
-		if rf.sendAppendEntries(server, &args, &reply) {
+		ok := rf.sendAppendEntries(server, &args, &reply)
+
+		if ok {
 			rf.mu.Lock()
 
+			// 如果任期变化或不再是Leader，停止处理
+			if rf.currentTerm != currentTerm || rf.state != Leader {
+				rf.mu.Unlock()
+				return
+			}
+
+			// 处理更高任期
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.state = Follower
@@ -312,36 +384,80 @@ func (rf *Raft) sendLogTo(server int) {
 				return
 			}
 
+			// 处理成功响应
 			if reply.Success {
-				rf.matchIndex[server] = prevLogIndex + len(entries)
-				rf.nextIndex[server] = rf.matchIndex[server] + 1
+				// 更新匹配索引
+				newMatchIndex := prevLogIndex + len(entries)
+				if newMatchIndex > rf.matchIndex[server] {
+					rf.matchIndex[server] = newMatchIndex
+				}
+				rf.nextIndex[server] = newMatchIndex + 1
 
+				// 检查是否可以提交新的日志
 				rf.checkCommit()
 				rf.mu.Unlock()
 				return
 			} else {
-				if rf.nextIndex[server] > 1 {
-					rf.nextIndex[server]--
+				// 处理日志不匹配
+				if reply.ConflictTerm != -1 {
+					// 查找Leader日志中最后一个与冲突任期匹配的条目
+					conflictTermLastIndex := -1
+					for i := len(rf.log) - 1; i >= 1; i-- {
+						if rf.log[i].Term == reply.ConflictTerm {
+							conflictTermLastIndex = i
+							break
+						}
+					}
+
+					if conflictTermLastIndex != -1 {
+						// 如果找到了匹配的任期，跳到该任期的下一个位置
+						rf.nextIndex[server] = conflictTermLastIndex + 1
+					} else {
+						// 如果没找到匹配的任期，跳到Follower冲突任期的第一个日志
+						rf.nextIndex[server] = reply.ConflictIndex
+					}
+				} else if reply.ConflictIndex >= 0 {
+					// Follower的日志比Leader短，直接跳到Follower的日志末尾
+					rf.nextIndex[server] = reply.ConflictIndex
+				} else {
+					// 保守策略：如果没有明确的冲突信息，就回退一步
+					if rf.nextIndex[server] > 1 {
+						rf.nextIndex[server]--
+					}
 				}
+
+				// 确保nextIndex至少为1
+				if rf.nextIndex[server] < 1 {
+					rf.nextIndex[server] = 1
+				}
+
+				// 立即尝试再次发送 - 加快同步速度
+				//go rf.sendLogTo(server)
+
+				rf.mu.Unlock()
 			}
-			rf.mu.Unlock()
 		}
-		time.Sleep(10 * time.Millisecond)
 	}
 }
 
 func (rf *Raft) checkCommit() {
 	for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
+		// 只考虑提交当前任期的日志条目（安全性保证）
 		if rf.log[i].Term == rf.currentTerm {
-			count := 1
+			count := 1 // 包括自己
 			for server := range rf.peers {
 				if server != rf.me && rf.matchIndex[server] >= i {
 					count++
 				}
 			}
+			// 如果大多数服务器已复制此日志条目，提交它
 			if count > len(rf.peers)/2 {
 				rf.commitIndex = i
-				go rf.applyLogs()
+				// 启动日志应用
+				if !rf.applyLogsActive {
+					rf.applyLogsActive = true
+					go rf.applyLogs()
+				}
 				break
 			}
 		}
@@ -349,17 +465,42 @@ func (rf *Raft) checkCommit() {
 }
 
 func (rf *Raft) applyLogs() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	for !rf.killed() {
+		rf.mu.Lock()
 
-	for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-		msg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[i].Command,
-			CommandIndex: i,
+		if rf.commitIndex > rf.lastApplied {
+			toApply := make([]ApplyMsg, 0)
+			lastApplied := rf.lastApplied // 保存当前值
+
+			// 准备要应用的日志
+			for i := lastApplied + 1; i <= rf.commitIndex; i++ {
+				if i < len(rf.log) && rf.log[i].Command != nil { // 确保命令非空
+					msg := ApplyMsg{
+						CommandValid: true,
+						Command:      rf.log[i].Command,
+						CommandIndex: i,
+					}
+					toApply = append(toApply, msg)
+				}
+			}
+
+			rf.mu.Unlock()
+
+			// 应用日志
+			for _, msg := range toApply {
+				rf.applyCh <- msg
+
+				// 应用后更新lastApplied
+				rf.mu.Lock()
+				if msg.CommandIndex > rf.lastApplied {
+					rf.lastApplied = msg.CommandIndex
+				}
+				rf.mu.Unlock()
+			}
+		} else {
+			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond) // 减少等待时间，更快响应
 		}
-		rf.applyCh <- msg
-		rf.lastApplied = i
 	}
 }
 
@@ -399,7 +540,7 @@ func (rf *Raft) ticker() {
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
+		ms := 60 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -409,9 +550,20 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.votedFor = rf.me
 
+	// 获取自己最后一条日志的索引和任期
+	lastLogIndex := len(rf.log) - 1
+	var lastLogTerm int
+	if lastLogIndex >= 0 {
+		lastLogTerm = rf.log[lastLogIndex].Term
+	} else {
+		lastLogTerm = 0
+	}
+
 	args := RequestVoteArgs{
-		Term:        rf.currentTerm,
-		CandidateId: rf.me,
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm:  lastLogTerm,
 	}
 
 	votes := 1
@@ -428,9 +580,7 @@ func (rf *Raft) startElection() {
 						if reply.VoteGranted {
 							votes++
 							if votes > len(rf.peers)/2 {
-								rf.state = Leader
-								rf.lastHeartbeat = time.Now()
-								go rf.broadcastHeartbeat()
+								rf.becomeLeader()
 							}
 						} else if reply.Term > rf.currentTerm {
 							rf.currentTerm = reply.Term
@@ -450,50 +600,167 @@ func (rf *Raft) broadcastHeartbeat() {
 			return
 		}
 
-		rf.mu.Lock()
-		args := AppendEntriesArgs{
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
-		}
-		rf.mu.Unlock()
-
+		// 向所有节点发送心跳
 		for i := range rf.peers {
 			if i != rf.me {
-				go func(peer int) {
+				go func(server int) {
+					rf.mu.Lock()
+
+					if rf.state != Leader {
+						rf.mu.Unlock()
+						return
+					}
+
+					// 计算prevLogIndex和prevLogTerm
+					prevLogIndex := rf.nextIndex[server] - 1
+					var prevLogTerm int
+					if prevLogIndex >= 0 && prevLogIndex < len(rf.log) {
+						prevLogTerm = rf.log[prevLogIndex].Term
+					}
+
+					// 准备心跳请求（可能包含日志条目）
+					args := AppendEntriesArgs{
+						Term:         rf.currentTerm,
+						LeaderId:     rf.me,
+						PrevLogIndex: prevLogIndex,
+						PrevLogTerm:  prevLogTerm,
+						LeaderCommit: rf.commitIndex,
+						// 心跳一般不包含条目，但如果有未复制的条目，也可以一并发送
+						Entries: make([]LogEntry, 0),
+					}
+
+					rf.mu.Unlock()
+
+					// 发送请求
 					reply := AppendEntriesReply{}
-					rf.sendAppendEntries(peer, &args, &reply)
+					if rf.sendAppendEntries(server, &args, &reply) {
+						rf.mu.Lock()
+
+						// 如果收到更高任期，转为Follower
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.state = Follower
+							rf.votedFor = -1
+							rf.mu.Unlock()
+							return
+						}
+
+						rf.mu.Unlock()
+					}
 				}(i)
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
+
+		time.Sleep(300 * time.Millisecond)
 	}
 }
 
 type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
+	Term         int        // 领导者的任期
+	LeaderId     int        // 领导者ID
+	PrevLogIndex int        // 新日志条目之前的日志索引
+	PrevLogTerm  int        // PrevLogIndex条目的任期
+	Entries      []LogEntry // 需要存储的日志条目（心跳为空）
+	LeaderCommit int        // 领导者的commitIndex
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term    int  // 当前任期，用于领导者更新自己
+	Success bool // 如果follower包含匹配prevLogIndex和prevLogTerm的日志则为true
+	// 用于快速回退
+	ConflictIndex int // 冲突的日志索引
+	ConflictTerm  int // 冲突的日志任期
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// 初始化回复
+	reply.Success = false
 	reply.Term = rf.currentTerm
+	reply.ConflictIndex = -1
+	reply.ConflictTerm = -1
+
+	// 如果接收到的任期小于当前任期，拒绝请求
 	if args.Term < rf.currentTerm {
-		reply.Success = false
 		return
 	}
 
-	rf.currentTerm = args.Term
-	rf.state = Follower
-	rf.votedFor = args.LeaderId
+	// 如果接收到更高任期，更新当前任期并转为follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+	}
+
+	// 更新心跳时间，确保在任何情况下都重置心跳时间
 	rf.lastHeartbeat = time.Now()
+	rf.state = Follower // 确保节点是Follower状态
+
+	// 确保日志数组已初始化
+	if len(rf.log) == 0 {
+		rf.log = make([]LogEntry, 1)
+		rf.log[0] = LogEntry{Term: 0}
+	}
+
+	// 日志一致性检查
+	if args.PrevLogIndex >= len(rf.log) {
+		// 日志太短
+		reply.ConflictIndex = len(rf.log)
+		reply.ConflictTerm = -1
+		return
+	}
+
+	if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// 任期不匹配
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+
+		// 找到该冲突任期的第一个日志条目
+		reply.ConflictIndex = args.PrevLogIndex
+		for i := args.PrevLogIndex - 1; i >= 1; i-- {
+			if rf.log[i].Term != reply.ConflictTerm {
+				reply.ConflictIndex = i + 1
+				break
+			}
+		}
+		return
+	}
+	// 附加新日志
 	reply.Success = true
+
+	// 处理日志条目 - 修改这部分代码确保正确处理大命令
+	if len(args.Entries) > 0 {
+		for i, entry := range args.Entries {
+			idx := args.PrevLogIndex + 1 + i
+			if idx >= len(rf.log) {
+				// 追加新条目
+				rf.log = append(rf.log, entry)
+			} else if rf.log[idx].Term != entry.Term {
+				// 删除不匹配的条目及其后的所有条目
+				rf.log = rf.log[:idx]
+				rf.log = append(rf.log, entry)
+			}
+			// 如果任期匹配，则保留原有条目
+		}
+	}
+
+	// 更新commitIndex
+	if args.LeaderCommit > rf.commitIndex {
+		newCommitIndex := min(args.LeaderCommit, len(rf.log)-1)
+		if newCommitIndex > rf.commitIndex {
+			rf.commitIndex = newCommitIndex
+			go rf.applyLogs()
+		}
+	}
+}
+
+// 辅助函数
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -511,17 +778,52 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
-	rf := &Raft{}
-	rf.peers = peers
-	rf.persister = persister
-	rf.me = me
+	rf := &Raft{
+		peers:           peers,
+		persister:       persister,
+		me:              me,
+		applyCh:         applyCh,
+		state:           Follower,
+		currentTerm:     0,
+		votedFor:        -1,
+		lastHeartbeat:   time.Now(),
+		log:             make([]LogEntry, 1), // 从索引1开始，0是哨兵
+		commitIndex:     0,                   // 初始时没有提交任何日志
+		lastApplied:     0,                   // 初始时没有应用任何日志
+		nextIndex:       nil,                 // 只有Leader才需要初始化这些
+		matchIndex:      nil,                 // 只有Leader才需要初始化这些
+		applyLogsActive: false,               // 初始时未启动日志应用协程
+	}
 
-	rf.state = Follower
-	rf.currentTerm = 0
-	rf.votedFor = -1
-	rf.lastHeartbeat = time.Now()
+	// 索引0是不使用的哨兵条目，Term为0
+	rf.log[0] = LogEntry{Term: 0}
 
+	// 从持久化存储中恢复状态（如果有）
+	rf.readPersist(persister.ReadRaftState())
+
+	// 启动周期性检查选举超时的goroutine
 	go rf.ticker()
 
 	return rf
+}
+
+// 成为Leader时初始化状态
+func (rf *Raft) becomeLeader() {
+	rf.state = Leader
+	rf.applyLogsActive = false // 确保当成为新Leader时重置此标志
+
+	// 初始化nextIndex和matchIndex
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	for i := range rf.peers {
+		rf.nextIndex[i] = len(rf.log) // 初始化为自己的日志长度
+		rf.matchIndex[i] = 0          // 初始时假设没有匹配
+	}
+
+	// 记录成为Leader的时间
+	rf.lastHeartbeat = time.Now()
+
+	// 立即发送心跳以建立权威
+	go rf.broadcastHeartbeat()
 }
