@@ -129,6 +129,7 @@ func (rf *Raft) persist() {
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.lastApplied)
+	e.Encode(rf.commitIndex)
 	raftstate := w.Bytes()
 
 	// 保持现有快照不变
@@ -161,7 +162,7 @@ func (rf *Raft) readPersist(data []byte) {
 	var log []LogEntry
 	var lastIncludedIndex int
 	var lastIncludedTerm int
-	var lastApplied int // 添加lastApplied变量
+	var lastApplied int
 
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
@@ -170,14 +171,13 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 
-	// 尝试解码快照字段，但允许它们可能不存在
+	// 尝试解码快照字段和新增的commitIndex字段，但允许它们可能不存在
 	if d.Decode(&lastIncludedIndex) != nil ||
 		d.Decode(&lastIncludedTerm) != nil ||
-		d.Decode(&lastApplied) != nil { // 添加对lastApplied的解码
-		// 如果找不到这些字段，使用默认值
+		d.Decode(&lastApplied) != nil {
 		lastIncludedIndex = 0
 		lastIncludedTerm = 0
-		lastApplied = 0 // 设置默认值
+		lastApplied = 0
 	}
 
 	rf.currentTerm = currentTerm
@@ -185,7 +185,7 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.log = log
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
-	rf.lastApplied = lastApplied // 恢复lastApplied值
+	rf.lastApplied = lastApplied
 }
 
 // the service says it has created a snapshot that has
@@ -504,6 +504,9 @@ func (rf *Raft) applyLogs() {
 				rf.lastApplied = i
 			}
 
+			// 持久化当前状态，因为lastApplied已更新
+			rf.persist()
+
 			// 获取applyCh的本地引用
 			applyCh := rf.applyCh
 
@@ -515,6 +518,8 @@ func (rf *Raft) applyLogs() {
 				applyCh <- msg
 			}
 		} else {
+			// 使用条件变量等待新的提交
+			rf.applyCond.Wait()
 			rf.mu.Unlock()
 		}
 	}
@@ -1029,11 +1034,9 @@ func (rf *Raft) sendHeartbeats() {
 			args.PrevLogIndex = rf.nextIndex[server] - 1
 			nextIndex := rf.nextIndex[server]
 
-			// 如果需要发送快照而不是日志
 			if args.PrevLogIndex < rf.lastIncludedIndex {
 				rf.mu.Unlock()
 
-				// 准备快照参数
 				rf.mu.Lock()
 				snapshot := rf.persister.ReadSnapshot()
 				arg := &InstallSnapshotArgs{
@@ -1049,11 +1052,10 @@ func (rf *Raft) sendHeartbeats() {
 				reply := &InstallSnapshotReply{}
 
 				if ok := rf.sendInstallSnapshot(server, arg, reply); !ok {
-					return // RPC失败，稍后重试
+					return
 				}
 
 				rf.mu.Lock()
-				// 如果任期变化或不再是Leader，退出
 				if rf.currentTerm != currentTerm || rf.state != Leader {
 					rf.mu.Unlock()
 					return
@@ -1063,23 +1065,19 @@ func (rf *Raft) sendHeartbeats() {
 					rf.currentTerm = reply.Term
 					rf.state = Follower
 					rf.votedFor = -1
-					rf.persist() // 持久化状态变更
+					rf.persist()
 					rf.mu.Unlock()
 					return
 				}
 
-				// 更新nextIndex和matchIndex
 				rf.nextIndex[server] = arg.LastIncludedIndex + 1
 				rf.matchIndex[server] = arg.LastIncludedIndex
 
-				// 检查是否可以提交新的日志
 				rf.checkCommit()
 				rf.mu.Unlock()
 			} else {
-				// 发送AppendEntries
 				lastLogIndex := rf.lastIncludedIndex + len(rf.log) - 1
 
-				// 准备日志条目
 				if nextIndex <= lastLogIndex {
 					relativeNextIndex := nextIndex - rf.lastIncludedIndex
 					if relativeNextIndex > 0 && relativeNextIndex < len(rf.log) {
@@ -1088,14 +1086,12 @@ func (rf *Raft) sendHeartbeats() {
 					}
 				}
 
-				// 确定PrevLogTerm
 				relativeIndex := args.PrevLogIndex - rf.lastIncludedIndex
 				if args.PrevLogIndex == rf.lastIncludedIndex {
 					args.PrevLogTerm = rf.lastIncludedTerm
 				} else if relativeIndex > 0 && relativeIndex < len(rf.log) {
 					args.PrevLogTerm = rf.log[relativeIndex].Term
 				} else {
-					// 无效的索引
 					rf.mu.Unlock()
 					return
 				}
@@ -1107,17 +1103,15 @@ func (rf *Raft) sendHeartbeats() {
 				ok := rf.sendAppendEntries(server, args, reply)
 
 				if !ok {
-					return // RPC失败，稍后重试
+					return
 				}
 
 				rf.mu.Lock()
-				// 如果任期变化或不再是Leader，退出
 				if rf.currentTerm != currentTerm || rf.state != Leader {
 					rf.mu.Unlock()
 					return
 				}
 
-				// 处理更高任期
 				if reply.Term > rf.currentTerm {
 					rf.currentTerm = reply.Term
 					rf.state = Follower
@@ -1128,20 +1122,16 @@ func (rf *Raft) sendHeartbeats() {
 				}
 
 				if reply.Success {
-					// 更新matchIndex和nextIndex
 					newMatchIndex := args.PrevLogIndex + len(args.Entries)
 					if newMatchIndex > rf.matchIndex[server] {
 						rf.matchIndex[server] = newMatchIndex
 					}
 					rf.nextIndex[server] = rf.matchIndex[server] + 1
 
-					// 检查是否可以提交新的日志
 					rf.checkCommit()
 					rf.mu.Unlock()
 				} else {
-					// 快速回退
 					if reply.ConflictTerm != -1 {
-						// 查找Leader日志中最后一个与冲突任期匹配的条目
 						conflictTermLastIndex := -1
 						for i := len(rf.log) - 1; i >= 0; i-- {
 							if rf.log[i].Term == reply.ConflictTerm {
@@ -1151,23 +1141,18 @@ func (rf *Raft) sendHeartbeats() {
 						}
 
 						if conflictTermLastIndex != -1 {
-							// 找到了匹配的任期，跳到该任期的下一个位置
 							rf.nextIndex[server] = conflictTermLastIndex + 1
 						} else {
-							// 如果没找到匹配的任期，跳到Follower冲突任期的第一个日志
 							rf.nextIndex[server] = reply.ConflictIndex
 						}
 					} else if reply.ConflictIndex != -1 {
-						// Follower的日志比Leader短
 						rf.nextIndex[server] = reply.ConflictIndex
 					} else {
-						// 保守策略：回退一步
 						if rf.nextIndex[server] > 1 {
 							rf.nextIndex[server]--
 						}
 					}
 
-					// 确保nextIndex至少为1
 					if rf.nextIndex[server] < 1 {
 						rf.nextIndex[server] = 1
 					}
@@ -1176,5 +1161,48 @@ func (rf *Raft) sendHeartbeats() {
 				}
 			}
 		}(i)
+	}
+}
+
+// RequestLogReplay 请求重放指定范围内的日志条目
+// startIndex: 开始索引（包含）
+// endIndex: 结束索引（包含）
+// 如果endIndex为-1，则重放到最新的已提交日志
+func (rf *Raft) RequestLogReplay(startIndex int, endIndex int) {
+	rf.mu.Lock()
+
+	validStartIndex := max(startIndex, rf.lastIncludedIndex+1)
+
+	validEndIndex := rf.commitIndex
+	if endIndex != -1 {
+		validEndIndex = min(endIndex, rf.commitIndex)
+	}
+
+	if validStartIndex > validEndIndex {
+		rf.mu.Unlock()
+		return
+	}
+
+	entriesToReplay := make([]ApplyMsg, 0)
+	for i := validStartIndex; i <= validEndIndex; i++ {
+		logIndex := i - rf.lastIncludedIndex
+
+		if logIndex <= 0 || logIndex >= len(rf.log) {
+			continue
+		}
+
+		entry := rf.log[logIndex]
+		msg := ApplyMsg{
+			CommandValid: true,
+			Command:      entry.Command,
+			CommandIndex: i,
+		}
+		entriesToReplay = append(entriesToReplay, msg)
+	}
+
+	rf.mu.Unlock()
+
+	for _, msg := range entriesToReplay {
+		rf.applyCh <- msg
 	}
 }

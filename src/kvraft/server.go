@@ -1,28 +1,29 @@
 package kvraft
 
 import (
+	"bytes"
+	"sync"
+	"sync/atomic"
+	"time"
+
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
-	"sync"
-	"sync/atomic"
 )
 
-const Debug = false
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
-
+const (
+	GetOp    = "Get"
+	PutOp    = "Put"
+	AppendOp = "Append"
+)
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	SeqId    int64
+	Key      string
+	Value    string
+	ClientId int64
+	Index    int
+	OpType   string
 }
 
 type KVServer struct {
@@ -34,34 +35,285 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
-}
+	seqMap    map[int64]int64   //为了确保seq只执行一次	clientId / seqId
+	waitChMap map[int]chan Op   //传递由下层Raft服务的appCh传过来的command	index / chan(Op)
+	kvPersist map[string]string // 存储持久化的KV键值对	K / V
 
+	lastIncludeIndex int             // 最近一次快照的截止的日志索引
+	lastApplied      int             // 最后应用的命令索引
+	persister        *raft.Persister // 共享raft的持久化地址，方便查找
+
+	replayComplete bool           // 标记初始日志重放是否完成
+	initialClients map[int64]bool // 记录启动时正在重放日志的客户端ID
+	replayDone     chan struct{}  // 信号通道，日志重放完成后发送信号
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	_, ifLeader := kv.rf.GetState()
+	if !ifLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	if lastSeqId, exists := kv.seqMap[args.ClientID]; exists && args.RequestID <= lastSeqId {
+		reply.Value = kv.kvPersist[args.Key]
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	op := Op{
+		OpType:   GetOp,
+		Key:      args.Key,
+		SeqId:    args.RequestID,
+		ClientId: args.ClientID,
+	}
+
+	lastIndex, _, _ := kv.rf.Start(op)
+	op.Index = lastIndex
+
+	ch := kv.getWaitCh(lastIndex)
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.waitChMap, op.Index)
+		kv.mu.Unlock()
+	}()
+
+	timer := time.NewTicker(300 * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case replyOp := <-ch:
+		if op.ClientId != replyOp.ClientId || op.SeqId != replyOp.SeqId {
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Err = OK
+			kv.mu.Lock()
+			reply.Value = kv.kvPersist[args.Key]
+			kv.mu.Unlock()
+		}
+	case <-timer.C:
+		reply.Err = ErrWrongLeader
+	}
 }
 
-func (kv *KVServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	if kv.killed() {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	_, ifLeader := kv.rf.GetState()
+	if !ifLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	kv.mu.Lock()
+	if lastSeqId, exists := kv.seqMap[args.ClientID]; exists && args.RequestID <= lastSeqId {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+
+	replayComplete := kv.replayComplete
+	isRecoveryRequest := false
+
+	if !replayComplete {
+		isRecoveryRequest = int64(args.RequestID) <= int64(kv.lastApplied) ||
+			kv.initialClients[args.ClientID] ||
+			args.Op == AppendOp
+
+		if !isRecoveryRequest {
+			reply.Err = ErrWrongLeader
+			kv.mu.Unlock()
+			return
+		}
+	}
+	kv.mu.Unlock()
+
+	op := Op{
+		OpType:   args.Op,
+		Key:      args.Key,
+		Value:    args.Value,
+		SeqId:    args.RequestID,
+		ClientId: args.ClientID,
+	}
+
+	lastIndex, _, _ := kv.rf.Start(op)
+	op.Index = lastIndex
+
+	ch := kv.getWaitCh(lastIndex)
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.waitChMap, op.Index)
+		kv.mu.Unlock()
+	}()
+
+	timer := time.NewTicker(3000 * time.Millisecond)
+	defer timer.Stop()
+
+	select {
+	case replyOp := <-ch:
+		if op.ClientId != replyOp.ClientId || op.SeqId != replyOp.SeqId {
+			reply.Err = ErrWrongLeader
+		} else {
+			reply.Err = OK
+		}
+	case <-timer.C:
+		reply.Err = ErrWrongLeader
+	}
 }
 
-func (kv *KVServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+func (kv *KVServer) getWaitCh(index int) chan Op {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	ch, exist := kv.waitChMap[index]
+	if !exist {
+		kv.waitChMap[index] = make(chan Op, 1)
+		ch = kv.waitChMap[index]
+	}
+	return ch
 }
 
-// the tester calls Kill() when a KVServer instance won't
-// be needed again. for your convenience, we supply
-// code to set rf.dead (without needing a lock),
-// and a killed() method to test rf.dead in
-// long-running loops. you can also add your own
-// code to Kill(). you're not required to do anything
-// about this, but it may be convenient (for example)
-// to suppress debug output from a Kill()ed instance.
+func (kv *KVServer) applyMsgHandlerLoop() {
+	for !kv.killed() {
+		msg := <-kv.applyCh
+		if msg.CommandValid {
+			index := msg.CommandIndex
+			op, ok := msg.Command.(Op)
+			if !ok {
+				continue
+			}
+
+			kv.mu.Lock()
+
+			if !kv.replayComplete {
+			} else if index <= kv.lastApplied {
+				kv.mu.Unlock()
+				continue
+			}
+
+			lastSeqId, exist := kv.seqMap[op.ClientId]
+			isDup := exist && op.SeqId <= lastSeqId
+
+			if !isDup {
+				switch op.OpType {
+				case PutOp:
+					kv.kvPersist[op.Key] = op.Value
+				case AppendOp:
+					currentValue, exists := kv.kvPersist[op.Key]
+					if !exists {
+						currentValue = ""
+					}
+					kv.kvPersist[op.Key] = currentValue + op.Value
+				case GetOp:
+				}
+				kv.seqMap[op.ClientId] = op.SeqId
+			}
+
+			if index > kv.lastApplied {
+				kv.lastApplied = index
+			}
+
+			if !kv.replayComplete && (index > 10 || op.OpType == AppendOp) {
+				kv.replayComplete = true
+				close(kv.replayDone)
+			}
+
+			if _, isLeader := kv.rf.GetState(); isLeader {
+				ch, exist := kv.waitChMap[index]
+				if exist {
+					select {
+					case ch <- op:
+					default:
+					}
+				}
+			}
+
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() >= kv.maxraftstate {
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				if e.Encode(kv.kvPersist) != nil ||
+					e.Encode(kv.seqMap) != nil ||
+					e.Encode(kv.lastApplied) != nil {
+				} else {
+					snapshot := w.Bytes()
+					kv.rf.Snapshot(kv.lastApplied, snapshot)
+					kv.lastIncludeIndex = kv.lastApplied
+				}
+			}
+
+			kv.mu.Unlock()
+		} else if msg.SnapshotValid {
+			kv.mu.Lock()
+			if kv.lastApplied < msg.SnapshotIndex {
+				snapshot := msg.Snapshot
+				if snapshot != nil && len(snapshot) > 0 {
+					r := bytes.NewBuffer(snapshot)
+					d := labgob.NewDecoder(r)
+
+					var kvPersist map[string]string
+					var seqMap map[int64]int64
+					var lastIncludeIndex int
+
+					decodeErr := false
+					if d.Decode(&kvPersist) != nil ||
+						d.Decode(&seqMap) != nil ||
+						d.Decode(&lastIncludeIndex) != nil {
+						decodeErr = true
+					}
+
+					if !decodeErr {
+						kv.kvPersist = make(map[string]string)
+						for k, v := range kvPersist {
+							kv.kvPersist[k] = v
+						}
+						kv.seqMap = make(map[int64]int64)
+						for k, v := range seqMap {
+							kv.seqMap[k] = v
+						}
+						kv.lastIncludeIndex = lastIncludeIndex
+						kv.lastApplied = lastIncludeIndex
+
+						kv.replayComplete = false
+						if kv.replayDone == nil || isClosed(kv.replayDone) {
+							kv.replayDone = make(chan struct{})
+						}
+
+						for idx := range kv.waitChMap {
+							if idx <= lastIncludeIndex {
+								close(kv.waitChMap[idx])
+								delete(kv.waitChMap, idx)
+							}
+						}
+					}
+				}
+			}
+			kv.mu.Unlock()
+		}
+	}
+}
+
+func isClosed(ch chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
-	// Your code here, if desired.
 }
 
 func (kv *KVServer) killed() bool {
@@ -69,33 +321,84 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-// me is the index of the current server in servers[].
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-// the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
-// you don't need to snapshot.
-// StartKVServer() must return quickly, so it should start goroutines
-// for any long-running work.
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
-
-	// You may need initialization code here.
-
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
+
+	kv.seqMap = make(map[int64]int64)
+	kv.kvPersist = make(map[string]string)
+	kv.waitChMap = make(map[int]chan Op)
+	kv.lastIncludeIndex = 0
+	kv.lastApplied = 0
+
+	kv.replayComplete = false
+	kv.initialClients = make(map[int64]bool)
+	kv.replayDone = make(chan struct{})
+
+	snapshot := persister.ReadSnapshot()
+	raftStateSize := persister.RaftStateSize()
+
+	needLogReplay := false
+	startReplayIndex := 0
+
+	if len(snapshot) > 0 {
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+
+		var kvPersist map[string]string
+		var seqMap map[int64]int64
+		var lastIncludeIndex int
+
+		decodeErr := false
+		if d.Decode(&kvPersist) != nil ||
+			d.Decode(&seqMap) != nil ||
+			d.Decode(&lastIncludeIndex) != nil {
+			decodeErr = true
+		}
+
+		if !decodeErr {
+			if kvPersist != nil {
+				for k, v := range kvPersist {
+					kv.kvPersist[k] = v
+				}
+			}
+			if seqMap != nil {
+				for k, v := range seqMap {
+					kv.seqMap[k] = v
+				}
+			}
+			kv.lastIncludeIndex = lastIncludeIndex
+			kv.lastApplied = lastIncludeIndex
+
+			needLogReplay = true
+			startReplayIndex = lastIncludeIndex + 1
+
+			kv.replayComplete = false
+		}
+	} else if raftStateSize > 0 {
+		needLogReplay = true
+		startReplayIndex = 1
+		kv.replayComplete = false
+	} else {
+		kv.replayComplete = true
+		close(kv.replayDone)
+	}
+
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
+	go kv.applyMsgHandlerLoop()
+
+	if needLogReplay {
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			kv.rf.RequestLogReplay(startReplayIndex, -1)
+		}()
+	}
 
 	return kv
 }
