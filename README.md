@@ -1,17 +1,18 @@
 # 2024-mit6.5840
-- pass lab1,lab2,lab3,lab4
+- pass lab1,lab2,lab3,lab4(余1),lab5(余1)，chllange(余1)
 
 其中lab3和lab4的部分测试仍有比较不低的概率不能通过（20%吧？lab3的figure8，lab4的多客户端分区恢复）。。
 
 ## 遇到的问题和解决方案：
-### 死锁问题
+死锁问题
+
 由于：
 
 	Raft持有锁 -> 尝试发送消息到applyCh -> KVServer尝试处理消息并获取锁 -> KVServer等待Raft释放锁 -> Raft等待消息被接收
 
 所以要在在锁外发送消息
 
-### 在lab4A中，对于kvserver重启后进行恢复的机制(日志重放，也就是将快照之后到raft的lastApplied之间的日志内容再应用一遍)，但在运行测试的时候仍然遇到这样的问题：168 yx 0 202 y之间的日志全部丢失了，
+ 在lab4A中，对于kvserver重启后进行恢复的机制(日志重放，也就是将快照之后到raft的lastApplied之间的日志内容再应用一遍)，但在运行测试的时候仍然遇到这样的问题：168 yx 0 202 y之间的日志全部丢失了，
 
 
     2025/03/24 17:33:00 [服务器 0] 键0更新: 新值=x 0 0 yx 0 1 yx 0 2 yx 0 3 yx 0 4 yx 0 5 yx 0 6 yx 0 7 yx 0 8 yx 0 9 yx 0 10 yx 0 11 yx 0 12 yx 0 13 yx 0 14 yx 0 15 yx 0 16 yx 0 17 yx 0 18 yx 0 19 yx 0 20 yx 0 21 y
@@ -83,4 +84,70 @@
 
 修复了日志重放的功能
 
+### lab5的问题
+做到这发现raft的commitIndex没有持久化到persist里面，加入这个之后lab4的TestPersistConcurrent4A居然就过不了了，之后再修吧。
 
+    // 如果endIndex为-1，则重放到最新的已提交日志
+    func (rf *Raft) RequestLogReplay(startIndex int, endIndex int) {
+        rf.mu.Lock()
+
+        validStartIndex := max(startIndex, rf.lastIncludedIndex+1)
+
+        validEndIndex := rf.commitIndex
+        if endIndex != -1 {
+            validEndIndex = min(endIndex, rf.commitIndex)
+        }
+
+        if validStartIndex > validEndIndex {
+            rf.mu.Unlock()
+            return
+        }
+        ...}
+
+数据迁移过程中的一致性问题（TestJoinLeave5B测试失败：）：
+
+问题原因：分片从Group 100迁移到Group 101的过程中，Group 100继续接收了对该分片的写入请求(APPEND key 4 += gKRDi)，但这个更新没有被迁移到Group 101，导致数据不一致。
+
+实现了两阶段分片迁移机制，通过分片状态管理确保数据一致性：
+添加分片状态跟踪：
+
+    const (
+     ShardNormal    = 0 // 正常状态
+     ShardMigrating = 1 // 迁移中状态
+     ShardWaiting   = 2 // 等待接收状态
+    )
+配置更新时标记分片状态：
+
+    离开组的分片标记为ShardMigrating
+    等待接收的分片标记为ShardWaiting
+    保持的分片标记为ShardNormal
+拒绝对非正常状态分片的请求：
+
+    if kv.shardStates[shard] == ShardMigrating || kv.shardStates[shard] == ShardWaiting {
+     reply.Err = ErrWrongGroup
+     return
+   }
+分片迁移完成后通知源组清理：
+目标组成功安装分片后，向源组发送清理请求，源组确认清理后才重置分片状态。
+将分片状态包含在快照中，确保崩溃恢复后状态一致
+
+还有好多来着，边问ai边改，改着改着就忘了
+
+## 还未解决的
+![测试截图](images/lab5.png)
+- Test: shard deletion (challenge 1) ...
+
+        Test: shard deletion (challenge 1) ...
+        --- FAIL: TestChallenge1Delete (52.32s)
+            test_test.go:888: snapshot + persisted Raft state are too big: 371162 > 117000
+感觉是和redis那个日志重写一样吧，就是删掉被覆盖掉的操作之类的，以后再试试
+
+- TestConcurrent3_5B
+
+        Test (5B): concurrent configuration change and restart...
+            ... Passed
+        --- FAIL: TestConcurrent3_5B (176.49s)
+        config.go:81: test took longer than 120 seconds
+然后用-race测试发现有竞争，下次写的时候再改吧。
+
+- 还有个上面提到的lab4的TestPersistConcurrent4A

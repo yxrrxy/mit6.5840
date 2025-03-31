@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	"bytes"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -222,7 +223,7 @@ func (kv *KVServer) applyMsgHandlerLoop() {
 			if index > kv.lastApplied {
 				kv.lastApplied = index
 			}
-
+			//在shardkv里改进了一下，这里已经能通过测试就不动了
 			if !kv.replayComplete && (index > 10 || op.OpType == AppendOp) {
 				kv.replayComplete = true
 				close(kv.replayDone)
@@ -395,7 +396,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	if needLogReplay {
 		go func() {
-			time.Sleep(100 * time.Millisecond)
+			time.Sleep(1000*time.Millisecond + time.Duration(rand.Intn(50))*time.Millisecond)
 			kv.rf.RequestLogReplay(startReplayIndex, -1)
 		}()
 	}

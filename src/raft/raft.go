@@ -163,6 +163,7 @@ func (rf *Raft) readPersist(data []byte) {
 	var lastIncludedIndex int
 	var lastIncludedTerm int
 	var lastApplied int
+	var commitIndex int
 
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
@@ -174,10 +175,12 @@ func (rf *Raft) readPersist(data []byte) {
 	// 尝试解码快照字段和新增的commitIndex字段，但允许它们可能不存在
 	if d.Decode(&lastIncludedIndex) != nil ||
 		d.Decode(&lastIncludedTerm) != nil ||
-		d.Decode(&lastApplied) != nil {
+		d.Decode(&lastApplied) != nil ||
+		d.Decode(&commitIndex) != nil {
 		lastIncludedIndex = 0
 		lastIncludedTerm = 0
 		lastApplied = 0
+		commitIndex = 0
 	}
 
 	rf.currentTerm = currentTerm
@@ -186,6 +189,7 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
 	rf.lastApplied = lastApplied
+	rf.commitIndex = commitIndex
 }
 
 // the service says it has created a snapshot that has
@@ -250,6 +254,7 @@ func (rf *Raft) persistStateAndSnapshot(snapshot []byte) {
 	e.Encode(rf.lastIncludedIndex)
 	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.lastApplied)
+	e.Encode(rf.commitIndex)
 	raftstate := w.Bytes()
 
 	// 确保snapshot不为nil
