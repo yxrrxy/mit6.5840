@@ -1,5 +1,5 @@
 # 2024-mit6.5840
-- pass lab1,lab2,lab3,lab4(余1),lab5(余1)，challenge(余1)
+- pass lab1,lab2,lab3,lab4(余1),lab5(余1),challenge(余1)
 
 其中lab3和lab4的部分测试仍有比较不低的概率不能通过（20%吧？lab3的figure8，lab4的多客户端分区恢复）。。
 
